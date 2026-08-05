@@ -32,8 +32,8 @@ This repo has two layers: the **marketplace root** and the **plugin** inside it.
       omnicheck-gitlab/                  ← Check skill (5-phase diff verification workflow)
         SKILL.md
         references/                     ← 2 files: analysis agent prompt + nudge guide
-    tools/omniforge_mcp_server.py       ← Python MCP server (FastMCP, 13 tools)
-    tests/                              ← 116 unit tests
+    tools/omniforge_mcp_server.py       ← Python MCP server (FastMCP, 14 tools)
+    tests/                              ← 125 unit tests
 ```
 
 The marketplace wrapper exists because `claude plugin marketplace add` requires plugins in subdirectories — it doesn't support a plugin at repo root.
@@ -77,7 +77,7 @@ Both skills support MCP tools (plugin install) with bash fallback (personal skil
 
 ### MCP Server (`tools/omniforge_mcp_server.py`)
 
-Single-file FastMCP server with 13 tools. The structure follows a pattern:
+Single-file FastMCP server with 14 tools. The structure follows a pattern:
 
 - **Validators** (`validate_mr_id`, `validate_repo_root`, `validate_branch_name`) — called at the top of every tool function
 - **`run_subprocess`** (aliased as `run_exec`) — all external commands go through this. Uses `create_subprocess_exec` (argument list, never shell), `stdin=DEVNULL` (prevents MCP pipe inheritance), and `asyncio.wait_for` timeout
@@ -86,7 +86,7 @@ Single-file FastMCP server with 13 tools. The structure follows a pattern:
 - **FastMCP wrappers** — thin `@mcp_server.tool()` decorated functions that call internal implementations and `json.dumps` the result
 - **Entry point** — `mcp_server.run()` at the bottom
 
-### 13 MCP Tools
+### 14 MCP Tools
 
 | Tool | Used By |
 |------|---------|
@@ -103,6 +103,7 @@ Single-file FastMCP server with 13 tools. The structure follows a pattern:
 | `resolve_discussion` | Fix |
 | `cleanup_omnifix_worktrees` | Fix |
 | `create_gitlab_mr` | Create |
+| `approve_mr` | Check |
 
 ### Key Invariant: `./references/` Paths
 
