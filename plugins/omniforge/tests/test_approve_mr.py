@@ -6,8 +6,6 @@ import os
 import sys
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
 
@@ -28,18 +26,8 @@ def _make_result(returncode=0, stdout="", stderr=""):
     return r
 
 
-def _run(coro):
-    """Run a coroutine, then reinstall a fresh event loop.
-
-    asyncio.run() clears the current event loop when it finishes. Other test
-    modules in this suite use the deprecated asyncio.get_event_loop() pattern,
-    which raises on Python 3.13 once no current loop exists. Leaving a fresh
-    loop installed keeps the whole suite order-independent.
-    """
-    try:
-        return asyncio.run(coro)
-    finally:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+# Event-loop hygiene across the mixed asyncio.run / get_event_loop suite is
+# handled by the autouse fixture in conftest.py; tests here just use asyncio.run.
 
 
 SAMPLE_MR_JSON = json.dumps({
@@ -71,7 +59,7 @@ class TestApproveMr:
         mock_run.side_effect = side_effect
 
         with patch.dict(os.environ, {"OMNICHECK_BOT_TOKEN": "glpat-bot-secret"}, clear=False):
-            result = _run(_approve_mr("136", repo))
+            result = asyncio.run(_approve_mr("136", repo))
 
         assert result["success"] is True
         assert result["approver"] == "bot"
@@ -112,7 +100,7 @@ class TestApproveMr:
         with patch.dict(os.environ, {}, clear=True):
             # OMNICHECK_BOT_TOKEN absent
             os.environ.pop("OMNICHECK_BOT_TOKEN", None)
-            result = _run(_approve_mr("136", repo))
+            result = asyncio.run(_approve_mr("136", repo))
 
         assert result["success"] is True
         assert result["approver"] == "current_user"
@@ -133,7 +121,7 @@ class TestApproveMr:
 
         mock_run.side_effect = side_effect
 
-        result = _run(_approve_mr("136", repo, sha="cafef00d"))
+        result = asyncio.run(_approve_mr("136", repo, sha="cafef00d"))
         assert result["success"] is True
         assert result["sha"] == "cafef00d"
         approve_args = mock_run.call_args_list[1][0][0]
@@ -150,7 +138,7 @@ class TestApproveMr:
             _make_result(0, SAMPLE_MR_JSON),
             _make_result(0, stdout="{}"),
         ]
-        result = _run(_approve_mr("136", repo))
+        result = asyncio.run(_approve_mr("136", repo))
         assert result["sha"] == "deadbeef"
 
     @patch("omniforge_mcp_server.run_exec", new_callable=AsyncMock)
@@ -163,7 +151,7 @@ class TestApproveMr:
             _make_result(0, SAMPLE_MR_JSON),
             _make_result(1, stderr="403 Forbidden: not allowed to approve"),
         ]
-        result = _run(_approve_mr("136", repo))
+        result = asyncio.run(_approve_mr("136", repo))
         assert result["success"] is False
         assert result["error_type"] == "approve_failed"
         assert "403" in result["error"]
@@ -175,7 +163,7 @@ class TestApproveMr:
         repo = _make_repo(tmp_path)
 
         mock_run.side_effect = [_make_result(1, stderr="404 Not Found")]
-        result = _run(_approve_mr("136", repo))
+        result = asyncio.run(_approve_mr("136", repo))
         assert result["success"] is False
         assert result["error_type"] == "mr_not_found"
         assert mock_run.call_count == 1  # only the IID fetch, no approve POST
@@ -183,14 +171,14 @@ class TestApproveMr:
     def test_invalid_mr_id(self, tmp_path):
         from omniforge_mcp_server import _approve_mr
         repo = _make_repo(tmp_path)
-        result = _run(_approve_mr("abc", repo))
+        result = asyncio.run(_approve_mr("abc", repo))
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
 
     def test_invalid_sha(self, tmp_path):
         from omniforge_mcp_server import _approve_mr
         repo = _make_repo(tmp_path)
-        result = _run(_approve_mr("136", repo, sha="not-a-sha!"))
+        result = asyncio.run(_approve_mr("136", repo, sha="not-a-sha!"))
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
 
@@ -202,6 +190,44 @@ class TestApproveMr:
             _make_result(0, SAMPLE_MR_JSON),
             _make_result(0, stdout="{}"),
         ]
-        result = _run(_approve_mr("!136", repo))
+        result = asyncio.run(_approve_mr("!136", repo))
         assert result["success"] is True
         assert result["mr_id"] == "136"
+
+    @patch("omniforge_mcp_server.run_exec", new_callable=AsyncMock)
+    def test_refuses_unpinned_when_no_head_sha(self, mock_run, tmp_path):
+        """If diff_refs has no head_sha and none was passed, refuse rather than approve unpinned."""
+        from omniforge_mcp_server import _approve_mr
+        repo = _make_repo(tmp_path)
+
+        no_head_sha = json.dumps({
+            "iid": 136,
+            "diff_refs": {"base_sha": "aaa111", "head_sha": "", "start_sha": "ccc333"},
+        })
+        mock_run.side_effect = [_make_result(0, no_head_sha)]
+
+        result = asyncio.run(_approve_mr("136", repo))
+        assert result["success"] is False
+        assert result["error_type"] == "no_head_sha"
+        # The approve endpoint was never hit — only the IID fetch ran.
+        assert mock_run.call_count == 1
+
+    @patch("omniforge_mcp_server.run_exec", new_callable=AsyncMock)
+    def test_explicit_sha_allows_approval_without_head_sha(self, mock_run, tmp_path):
+        """An explicit sha bypasses the no-head-sha guard (caller took responsibility)."""
+        from omniforge_mcp_server import _approve_mr
+        repo = _make_repo(tmp_path)
+
+        no_head_sha = json.dumps({
+            "iid": 136,
+            "diff_refs": {"base_sha": "aaa111", "head_sha": "", "start_sha": "ccc333"},
+        })
+        mock_run.side_effect = [
+            _make_result(0, no_head_sha),
+            _make_result(0, stdout="{}"),
+        ]
+
+        result = asyncio.run(_approve_mr("136", repo, sha="cafef00d"))
+        assert result["success"] is True
+        assert result["sha"] == "cafef00d"
+

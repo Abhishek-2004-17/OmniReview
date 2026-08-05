@@ -33,9 +33,36 @@ def validate_repo_root(repo_root: str) -> str:
     """Validate repo_root is an absolute path to a git repository."""
     if not os.path.isabs(repo_root):
         raise ValueError(f"repo_root must be absolute: {repo_root}")
-    if not os.path.isdir(os.path.join(repo_root, ".git")):
+    git_path = os.path.join(repo_root, ".git")
+    if not (os.path.isdir(git_path) or os.path.isfile(git_path)):
         raise ValueError(f"Not a git repository: {repo_root}")
     return repo_root
+
+
+async def _resolve_main_repo_root(repo_root: str) -> str:
+    """If repo_root is a worktree, return the main repository root.
+
+    Otherwise return repo_root unchanged.
+
+    Uses ``git rev-parse --git-common-dir`` which always resolves to the
+    shared/common git directory regardless of whether *repo_root* is the
+    main checkout or a linked worktree.  The main repo root is the parent
+    directory of that common git dir.
+    """
+    r = await run_exec(
+        ["git", "rev-parse", "--git-common-dir"], cwd=repo_root, timeout=10,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return repo_root
+    # git may return a relative path (e.g. ".git"); resolve against repo_root
+    common_dir = os.path.abspath(os.path.join(repo_root, r.stdout.strip()))
+    main_root = os.path.dirname(common_dir)
+    # Guard against the unlikely case where basename is still ".git"
+    if os.path.basename(main_root) == ".git":
+        main_root = os.path.dirname(main_root)
+    if os.path.abspath(main_root) == os.path.abspath(repo_root):
+        return repo_root
+    return main_root
 
 
 def validate_branch_name(branch: str) -> str:
@@ -310,12 +337,15 @@ async def _create_review_worktrees(mr_id: str, source_branch: str, repo_root: st
     except ValueError as e:
         return {"success": False, "error": str(e), "error_type": "validation_error"}
 
-    worktrees_dir = os.path.join(repo_root, ".worktrees")
+    # Resolve main repo root (handles worktrees)
+    main_root = await _resolve_main_repo_root(repo_root)
+
+    worktrees_dir = os.path.join(main_root, ".worktrees")
     os.makedirs(worktrees_dir, exist_ok=True)
 
     # Ensure .worktrees/ is in .gitignore
-    gitignore_path = os.path.join(repo_root, ".gitignore")
-    result = await run_exec(["git", "check-ignore", "-q", ".worktrees"], cwd=repo_root)
+    gitignore_path = os.path.join(main_root, ".gitignore")
+    result = await run_exec(["git", "check-ignore", "-q", ".worktrees"], cwd=main_root)
     if result.returncode != 0:
         existing = ""
         if os.path.exists(gitignore_path):
@@ -333,18 +363,18 @@ async def _create_review_worktrees(mr_id: str, source_branch: str, repo_root: st
         if os.path.exists(path):
             await run_exec(
                 ["git", "worktree", "remove", path, "--force"],
-                cwd=repo_root, timeout=30,
+                cwd=main_root, timeout=30,
             )
             stale_count += 1
             if os.path.exists(path):
                 shutil.rmtree(path, ignore_errors=True)
 
-    await run_exec(["git", "worktree", "prune"], cwd=repo_root)
+    await run_exec(["git", "worktree", "prune"], cwd=main_root)
 
     # Fetch source branch
     fetch = await run_exec(
         ["git", "fetch", "origin", source_branch],
-        cwd=repo_root, timeout=120,
+        cwd=main_root, timeout=120,
     )
     if fetch.returncode != 0:
         return {
@@ -361,15 +391,15 @@ async def _create_review_worktrees(mr_id: str, source_branch: str, repo_root: st
         r = await run_exec(
             ["git", "worktree", "add", path,
              f"origin/{source_branch}", "--detach"],
-            cwd=repo_root, timeout=30,
+            cwd=main_root, timeout=30,
         )
         if r.returncode != 0:
             for _, cp in created.items():
                 await run_exec(
                     ["git", "worktree", "remove", cp, "--force"],
-                    cwd=repo_root, timeout=30,
+                    cwd=main_root, timeout=30,
                 )
-            await run_exec(["git", "worktree", "prune"], cwd=repo_root)
+            await run_exec(["git", "worktree", "prune"], cwd=main_root)
             return {
                 "success": False,
                 "error": f"Failed to create worktree '{name}': {r.stderr}",
@@ -396,7 +426,10 @@ async def _cleanup_review_worktrees(mr_id: str, repo_root: str) -> dict:
     except ValueError as e:
         return {"success": False, "error": str(e), "error_type": "validation_error"}
 
-    worktrees_dir = os.path.join(repo_root, ".worktrees")
+    # Resolve main repo root (handles worktrees)
+    main_root = await _resolve_main_repo_root(repo_root)
+
+    worktrees_dir = os.path.join(main_root, ".worktrees")
     removed = []
     already_clean = []
     errors = []
@@ -411,7 +444,7 @@ async def _cleanup_review_worktrees(mr_id: str, repo_root: str) -> dict:
 
         await run_exec(
             ["git", "worktree", "remove", path, "--force"],
-            cwd=repo_root, timeout=30,
+            cwd=main_root, timeout=30,
         )
 
         if os.path.exists(path):
@@ -423,7 +456,7 @@ async def _cleanup_review_worktrees(mr_id: str, repo_root: str) -> dict:
 
         removed.append(name)
 
-    await run_exec(["git", "worktree", "prune"], cwd=repo_root)
+    await run_exec(["git", "worktree", "prune"], cwd=main_root)
 
     return {
         "success": len(errors) == 0,
@@ -870,7 +903,10 @@ async def _cleanup_omnifix_worktrees(mr_id: str, repo_root: str) -> dict:
     except ValueError as e:
         return {"success": False, "error": str(e), "error_type": "validation_error"}
 
-    worktrees_dir = os.path.join(repo_root, ".worktrees")
+    # Resolve main repo root (handles worktrees)
+    main_root = await _resolve_main_repo_root(repo_root)
+
+    worktrees_dir = os.path.join(main_root, ".worktrees")
     removed = []
     already_clean = []
     errors = []
@@ -881,7 +917,7 @@ async def _cleanup_omnifix_worktrees(mr_id: str, repo_root: str) -> dict:
     if os.path.exists(fix_path):
         await run_exec(
             ["git", "worktree", "remove", fix_path, "--force"],
-            cwd=repo_root, timeout=30,
+            cwd=main_root, timeout=30,
         )
         if os.path.exists(fix_path):
             try:
@@ -901,7 +937,7 @@ async def _cleanup_omnifix_worktrees(mr_id: str, repo_root: str) -> dict:
             triage_name = os.path.basename(triage_path)
             await run_exec(
                 ["git", "worktree", "remove", triage_path, "--force"],
-                cwd=repo_root, timeout=30,
+                cwd=main_root, timeout=30,
             )
             if os.path.exists(triage_path):
                 try:
@@ -914,11 +950,11 @@ async def _cleanup_omnifix_worktrees(mr_id: str, repo_root: str) -> dict:
     # 3. Delete temp branch (ignore error if doesn't exist)
     await run_exec(
         ["git", "branch", "-D", f"omnifix-temp-{mr_id}"],
-        cwd=repo_root, timeout=10,
+        cwd=main_root, timeout=10,
     )
 
     # 4. Prune
-    await run_exec(["git", "worktree", "prune"], cwd=repo_root)
+    await run_exec(["git", "worktree", "prune"], cwd=main_root)
 
     return {
         "success": len(errors) == 0,
@@ -947,8 +983,10 @@ async def _approve_mr(mr_id: str, repo_root: str, sha: str = "") -> dict:
     When the OMNICHECK_BOT_TOKEN environment variable is set, the single approval
     call authenticates as the bot (via GITLAB_TOKEN) so it can approve MRs whose
     creator/committer approval settings block the current glab user. Otherwise it
-    approves as the current glab user. The approval is pinned to the MR's HEAD sha
-    (resolved automatically when sha is empty) so it becomes stale if new commits land.
+    approves as the current glab user. The approval is ALWAYS pinned to a commit
+    sha: the caller-provided sha if given, else the MR's resolved HEAD sha. If
+    neither is available the call is refused — an unpinned approval would not go
+    stale on new commits, contradicting the tool's contract.
     """
     try:
         mr_id = validate_mr_id(mr_id)
@@ -968,6 +1006,18 @@ async def _approve_mr(mr_id: str, repo_root: str, sha: str = "") -> dict:
     iid = diff_refs["iid"]
     head_sha = sha if sha else diff_refs.get("head_sha", "")
 
+    # Guard: never approve unpinned. Without a sha the approval would not be
+    # invalidated by new commits, silently weakening the gate.
+    if not head_sha:
+        return {
+            "success": False,
+            "error": (
+                f"Cannot pin approval for MR !{mr_id}: no HEAD sha resolved and none "
+                f"provided. Re-fetch the MR or pass an explicit sha."
+            ),
+            "error_type": "no_head_sha",
+        }
+
     # Determine approver: bot when its token is configured, else current glab user
     bot_token = os.environ.get(OMNICHECK_BOT_TOKEN_ENV, "")
     used_bot = bool(bot_token)
@@ -976,9 +1026,8 @@ async def _approve_mr(mr_id: str, repo_root: str, sha: str = "") -> dict:
         "glab", "api",
         f"projects/:fullpath/merge_requests/{iid}/approve",
         "--method", "POST",
+        "--raw-field", f"sha={head_sha}",
     ]
-    if head_sha:
-        args.extend(["--raw-field", f"sha={head_sha}"])
 
     # Run the one approval call as the bot when configured. env fully replaces the
     # inherited environment, so we merge os.environ and override GITLAB_TOKEN.
@@ -1003,6 +1052,542 @@ async def _approve_mr(mr_id: str, repo_root: str, sha: str = "") -> dict:
         "sha": head_sha,
         "approver": "bot" if used_bot else "current_user",
         "action": "mr_approved",
+    }
+
+
+# ── GitHub Platform Detection & Helpers ───────────────────
+
+
+async def _detect_platform(repo_root: str) -> str:
+    """Detect whether the repo uses GitLab or GitHub.
+
+    Returns ``'gitlab'``, ``'github'``, or ``'unknown'``.
+
+    Checks ``git remote -v`` for github.com or gitlab.com patterns first,
+    then falls back to checking which CLI tool is authenticated.
+    """
+    r = await run_exec(["git", "remote", "-v"], cwd=repo_root, timeout=10)
+    if r.returncode == 0:
+        remote_url = r.stdout.lower()
+        if "github.com" in remote_url:
+            return "github"
+        if "gitlab.com" in remote_url:
+            return "gitlab"
+        # Check for self-hosted GitLab (common patterns)
+        if "gitlab" in remote_url:
+            return "gitlab"
+
+    # Fallback: check which CLI is available
+    gh_check = await run_exec(["gh", "auth", "status"], cwd=repo_root, timeout=10)
+    if gh_check.returncode == 0:
+        return "github"
+    glab_check = await run_exec(["glab", "auth", "status"], cwd=repo_root, timeout=10)
+    if glab_check.returncode == 0:
+        return "gitlab"
+
+    return "unknown"
+
+
+async def _get_github_repo_id(repo_root: str) -> str:
+    """Get the ``owner/repo`` identifier for GitHub API calls."""
+    r = await run_exec(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        cwd=repo_root, timeout=10,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+async def _get_pr_head_sha(pr_id: str, repo_root: str) -> str:
+    """Get the HEAD SHA of a GitHub PR for inline comment positioning."""
+    r = await run_exec(
+        ["gh", "pr", "view", pr_id, "--json", "headRefOid", "-q", ".headRefOid"],
+        cwd=repo_root, timeout=10,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+# ── GitHub Tool Implementations ───────────────────────────
+
+
+def validate_pr_id(pr_id: str) -> str:
+    """Strip leading '#' and validate pr_id is numeric."""
+    pr_id = pr_id.lstrip('#')
+    if not re.match(r'^\d+$', pr_id):
+        raise ValueError(f"Invalid PR ID: {pr_id}. Must be numeric.")
+    return pr_id
+
+
+async def _fetch_pr_data(pr_id: str, repo_root: str) -> dict:
+    """Fetch all GitHub PR data (metadata, comments, diff, commits) in one call."""
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    # Verify gh auth
+    auth = await run_exec(["gh", "auth", "status"], cwd=repo_root)
+    if auth.returncode != 0:
+        return {
+            "success": False,
+            "error": "gh not authenticated. Run 'gh auth login'.",
+            "error_type": "auth_failure",
+        }
+
+    # Fetch PR metadata (JSON)
+    pr_json = await run_exec(
+        [
+            "gh", "pr", "view", pr_id, "--json",
+            "title,body,headRefName,baseRefName,state,labels,assignees,"
+            "reviewRequests,comments,author",
+        ],
+        cwd=repo_root,
+    )
+    if pr_json.returncode != 0:
+        return {
+            "success": False,
+            "error": f"PR #{pr_id} not found.",
+            "error_type": "pr_not_found",
+        }
+
+    try:
+        metadata = json.loads(pr_json.stdout)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "error": f"Failed to parse PR #{pr_id} metadata.",
+            "error_type": "parse_error",
+        }
+
+    # Fetch diff (longer timeout)
+    diff_r = await run_exec(
+        ["gh", "pr", "diff", pr_id], cwd=repo_root, timeout=120
+    )
+    raw_diff = diff_r.stdout if diff_r.returncode == 0 else ""
+    diff_lines = raw_diff.count('\n')
+
+    # Extract branch names from GitHub JSON fields
+    source_branch = metadata.get("headRefName", "")
+    target_branch = metadata.get("baseRefName", "")
+
+    # Fetch commit list via gh pr view --json commits
+    commits_r = await run_exec(
+        [
+            "gh", "pr", "view", pr_id, "--json", "commits",
+            "-q", '.commits[] | "\(.oid[:7]) \(.messageHeadline)"',
+        ],
+        cwd=repo_root, timeout=30,
+    )
+    commits_text = commits_r.stdout if commits_r.returncode == 0 else ""
+
+    # Build comments text from metadata
+    comments_list = metadata.get("comments", [])
+    comments_parts = []
+    for c in comments_list:
+        author = c.get("author", {}).get("login", "unknown")
+        body = c.get("body", "")
+        comments_parts.append(f"**{author}**:\n{body}")
+    comments = "\n\n---\n\n".join(comments_parts)
+
+    files_changed = extract_changed_files(raw_diff)
+    diff_text, diff_truncated = truncate_diff_if_needed(raw_diff, diff_lines)
+    diff_line_map = parse_diff_line_map(raw_diff)
+
+    return {
+        "success": True,
+        "pr_id": pr_id,
+        "title": metadata.get("title", ""),
+        "author": metadata.get("author", {}).get("login", ""),
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "state": metadata.get("state", ""),
+        "description": metadata.get("body", "") or "",
+        "comments": comments,
+        "diff": diff_text,
+        "diff_line_count": diff_lines,
+        "diff_too_large": diff_lines > MAX_DIFF_LINES,
+        "diff_truncated": diff_truncated,
+        "diff_line_map": diff_line_map,
+        "commits": parse_commits(commits_text),
+        "files_changed": files_changed,
+        "labels": [l.get("name", "") for l in metadata.get("labels", [])],
+        "assignees": [a.get("login", "") for a in metadata.get("assignees", [])],
+        "reviewers": [r.get("login", "") for r in metadata.get("reviewRequests", [])],
+    }
+
+
+async def _post_pr_review_summary(pr_id: str, summary: str, repo_root: str) -> dict:
+    """Post a top-level summary comment on a GitHub PR."""
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    if not summary or not summary.strip():
+        return {"success": False, "error": "Summary text is empty.", "error_type": "validation_error"}
+
+    r = await run_exec(
+        ["gh", "pr", "comment", pr_id, "--body", summary],
+        cwd=repo_root,
+    )
+    if r.returncode != 0:
+        return {
+            "success": False,
+            "error": f"Failed to post summary: {r.stderr}",
+            "error_type": "post_failed",
+        }
+
+    return {"success": True, "pr_id": pr_id, "action": "summary_posted"}
+
+
+async def _post_pr_inline_thread(
+    pr_id: str,
+    file_path: str,
+    line_number: int,
+    body: str,
+    repo_root: str,
+) -> dict:
+    """Post an inline review comment on a GitHub PR diff line."""
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    if not body or not body.strip():
+        return {"success": False, "error": "Thread body is empty.", "error_type": "validation_error"}
+    if line_number < 1:
+        return {"success": False, "error": "line_number must be >= 1.", "error_type": "validation_error"}
+
+    # Get owner/repo
+    repo_id = await _get_github_repo_id(repo_root)
+    if not repo_id:
+        return {
+            "success": False,
+            "error": "Could not determine GitHub repo (owner/repo). Run 'gh repo set-default'.",
+            "error_type": "repo_not_found",
+        }
+
+    # Get PR head SHA for commit_id
+    head_sha = await _get_pr_head_sha(pr_id, repo_root)
+    if not head_sha:
+        return {
+            "success": False,
+            "error": f"Could not fetch HEAD SHA for PR #{pr_id}.",
+            "error_type": "pr_not_found",
+        }
+
+    r = await run_exec(
+        [
+            "gh", "api",
+            f"repos/{repo_id}/pulls/{pr_id}/comments",
+            "--method", "POST",
+            "--field", f"body={body}",
+            "--field", f"commit_id={head_sha}",
+            "--field", f"path={file_path}",
+            "--field", f"line={line_number}",
+            "--field", "side=RIGHT",
+        ],
+        cwd=repo_root,
+    )
+    if r.returncode != 0:
+        return {
+            "success": False,
+            "error": f"Failed to post thread on {file_path}:{line_number}: {r.stderr}",
+            "error_type": "post_failed",
+        }
+
+    return {
+        "success": True,
+        "pr_id": pr_id,
+        "file": file_path,
+        "line": line_number,
+        "action": "inline_thread_posted",
+    }
+
+
+async def _post_pr_full_review(
+    pr_id: str,
+    summary: str,
+    findings: list,
+    repo_root: str,
+) -> dict:
+    """Post a full GitHub PR review: summary comment + inline threads for each finding.
+
+    findings: list of dicts with file_path (str), line_number (int), body (str).
+    """
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    results = {"summary": None, "threads": [], "errors": []}
+
+    # Post summary
+    summary_result = await _post_pr_review_summary(pr_id, summary, repo_root)
+    results["summary"] = summary_result
+    if not summary_result["success"]:
+        results["errors"].append(f"Summary: {summary_result['error']}")
+
+    # Post each finding as an inline thread
+    for i, finding in enumerate(findings):
+        fp = finding.get("file_path", "")
+        ln = finding.get("line_number", 0)
+        body = finding.get("body", "")
+
+        if not fp or not body or ln < 1:
+            results["errors"].append(
+                f"Finding {i+1}: missing file_path, line_number, or body"
+            )
+            results["threads"].append({
+                "success": False, "index": i + 1, "error": "invalid finding",
+            })
+            continue
+
+        thread_result = await _post_pr_inline_thread(pr_id, fp, ln, body, repo_root)
+        results["threads"].append({
+            "success": thread_result["success"],
+            "index": i + 1,
+            "file": fp,
+            "line": ln,
+            "error": thread_result.get("error", ""),
+        })
+        if not thread_result["success"]:
+            results["errors"].append(
+                f"Finding {i+1} ({fp}:{ln}): {thread_result['error']}"
+            )
+
+    posted = sum(1 for t in results["threads"] if t["success"])
+
+    return {
+        "success": len(results["errors"]) == 0,
+        "pr_id": pr_id,
+        "summary_posted": results["summary"]["success"] if results["summary"] else False,
+        "threads_posted": posted,
+        "threads_total": len(findings),
+        "errors": results["errors"],
+    }
+
+
+async def _create_github_pr(
+    repo_root: str,
+    title: str = None,
+    description: str = None,
+    target_branch: str = "main",
+    source_branch: str = None,
+    assignees: str = None,
+    reviewers: str = None,
+    labels: str = None,
+    draft: bool = False,
+    web: bool = False,
+) -> dict:
+    """Create a GitHub pull request using gh CLI safely."""
+    try:
+        repo_root = validate_repo_root(repo_root)
+        if target_branch:
+            target_branch = validate_target_branch(target_branch)
+        if source_branch:
+            source_branch = validate_branch_name(source_branch)
+        if title:
+            title = validate_title(title)
+        if labels:
+            labels = validate_labels(labels)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    # Build the command args safely (list of strings, no shell interpretation)
+    args = ["gh", "pr", "create"]
+
+    if target_branch:
+        args.extend(["--base", target_branch])
+    if source_branch:
+        args.extend(["--head", source_branch])
+    if title:
+        args.extend(["--title", title])
+    if description:
+        args.extend(["--body", description])
+    if assignees:
+        args.extend(["--assignee", assignees])
+    if reviewers:
+        args.extend(["--reviewer", reviewers])
+    if labels:
+        args.extend(["--label", labels])
+    if draft:
+        args.append("--draft")
+    if web:
+        args.append("--web")
+
+    r = await run_exec(args, cwd=repo_root, timeout=120)
+
+    if r.returncode != 0:
+        return {
+            "success": False,
+            "error": f"Failed to create PR: {r.stderr}",
+            "error_type": "pr_creation_failed",
+        }
+
+    # Parse PR URL from output
+    pr_url = ""
+    for line in r.stdout.strip().split("\n"):
+        for word in line.split():
+            if word.startswith("http"):
+                pr_url = word
+                break
+        if pr_url:
+            break
+
+    return {
+        "success": True,
+        "pr_url": pr_url,
+        "output": r.stdout.strip(),
+        "action": "pr_created",
+    }
+
+
+async def _fetch_pr_discussions(pr_id: str, repo_root: str) -> dict:
+    """Fetch all review comments (inline threads) from a GitHub PR."""
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    # Get owner/repo
+    repo_id = await _get_github_repo_id(repo_root)
+    if not repo_id:
+        return {
+            "success": False,
+            "error": "Could not determine GitHub repo (owner/repo). Run 'gh repo set-default'.",
+            "error_type": "repo_not_found",
+        }
+
+    r = await run_exec(
+        ["gh", "api", f"repos/{repo_id}/pulls/{pr_id}/comments", "--paginate"],
+        cwd=repo_root, timeout=120,
+    )
+    if r.returncode != 0:
+        return {
+            "success": False,
+            "error": f"Failed to fetch discussions: {r.stderr}",
+            "error_type": "api_error",
+        }
+
+    try:
+        raw_comments = json.loads(r.stdout) if r.stdout.strip() else []
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "error": "Failed to parse discussions JSON.",
+            "error_type": "parse_error",
+        }
+
+    # GitHub uses flat comments with in_reply_to. Group them into threads.
+    # Top-level comments have no in_reply_to_id; replies reference their parent.
+    threads_by_id = {}
+    replies = []
+
+    for comment in raw_comments:
+        reply_to = comment.get("in_reply_to_id")
+        if reply_to is not None:
+            replies.append(comment)
+        else:
+            cid = comment.get("id")
+            threads_by_id[cid] = {
+                "id": str(cid),
+                "type": "inline" if comment.get("path") else "general",
+                "file_path": comment.get("path"),
+                "line_number": comment.get("line") or comment.get("original_line"),
+                "body": comment.get("body", ""),
+                "author": comment.get("user", {}).get("login", ""),
+                "created_at": comment.get("created_at", ""),
+                "replies": [],
+            }
+
+    # Attach replies to their parent threads
+    for reply in replies:
+        parent_id = reply.get("in_reply_to_id")
+        parent = threads_by_id.get(parent_id)
+        reply_data = {
+            "author": reply.get("user", {}).get("login", ""),
+            "body": reply.get("body", ""),
+            "created_at": reply.get("created_at", ""),
+        }
+        if parent:
+            parent["replies"].append(reply_data)
+        else:
+            # Orphan reply (parent deleted etc.) — create a standalone thread
+            rid = reply.get("id")
+            threads_by_id[rid] = {
+                "id": str(rid),
+                "type": "general",
+                "file_path": reply.get("path"),
+                "line_number": reply.get("line") or reply.get("original_line"),
+                "body": reply.get("body", ""),
+                "author": reply.get("user", {}).get("login", ""),
+                "created_at": reply.get("created_at", ""),
+                "replies": [],
+            }
+
+    discussions = list(threads_by_id.values())
+
+    return {
+        "success": True,
+        "pr_id": pr_id,
+        "discussions": discussions,
+        "total": len(discussions),
+    }
+
+
+async def _reply_to_pr_comment(
+    pr_id: str, comment_id: str, body: str, repo_root: str
+) -> dict:
+    """Reply to a specific review comment on a GitHub PR."""
+    try:
+        pr_id = validate_pr_id(pr_id)
+        repo_root = validate_repo_root(repo_root)
+    except ValueError as e:
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
+
+    if not body or not body.strip():
+        return {"success": False, "error": "Reply body is empty.", "error_type": "validation_error"}
+
+    # Get owner/repo
+    repo_id = await _get_github_repo_id(repo_root)
+    if not repo_id:
+        return {
+            "success": False,
+            "error": "Could not determine GitHub repo (owner/repo). Run 'gh repo set-default'.",
+            "error_type": "repo_not_found",
+        }
+
+    r = await run_exec(
+        [
+            "gh", "api",
+            f"repos/{repo_id}/pulls/{pr_id}/comments",
+            "--method", "POST",
+            "--field", f"body={body}",
+            "--field", f"in_reply_to={comment_id}",
+        ],
+        cwd=repo_root,
+    )
+    if r.returncode != 0:
+        return {
+            "success": False,
+            "error": f"Failed to reply: {r.stderr}",
+            "error_type": "post_failed",
+        }
+
+    return {
+        "success": True,
+        "pr_id": pr_id,
+        "comment_id": comment_id,
+        "action": "reply_posted",
     }
 
 
@@ -1228,8 +1813,9 @@ async def approve_mr(mr_id: str, repo_root: str, sha: str = "") -> str:
     Approves as the OmniCheck bot when the OMNICHECK_BOT_TOKEN environment
     variable is set, otherwise as the current glab user. This lets a separate
     bot account approve MRs even when "Prevent approval by creator/committer"
-    would block the human user. The approval is pinned to HEAD sha (resolved
-    automatically when sha is empty), so it goes stale if new commits land.
+    would block the human user. The approval is always pinned to a commit sha
+    (the provided sha, or the MR HEAD sha resolved automatically) so it goes
+    stale if new commits land; if no sha can be resolved the call is refused.
 
     Args:
         mr_id: Merge request number (e.g., '136' or '!136')
@@ -1306,6 +1892,131 @@ async def create_gitlab_mr(
         milestone=milestone if milestone else None,
         web=web,
     )
+    return json.dumps(result, indent=2)
+
+
+# ── GitHub FastMCP Tools ───────────────────────────────────
+
+
+@mcp_server.tool()
+async def fetch_pr_data(pr_id: str, repo_root: str) -> str:
+    """Fetch all GitHub PR data (metadata, comments, diff, commits) in one call.
+
+    Args:
+        pr_id: Pull request number (e.g., '42' or '#42')
+        repo_root: Absolute path to the git repository root
+    """
+    result = await _fetch_pr_data(pr_id, repo_root)
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+async def create_github_pr(
+    repo_root: str,
+    title: str = "",
+    description: str = "",
+    target_branch: str = "main",
+    source_branch: str = "",
+    assignees: str = "",
+    reviewers: str = "",
+    labels: str = "",
+    draft: bool = False,
+    web: bool = False,
+) -> str:
+    """Create a GitHub pull request using gh CLI with safe execution.
+
+    Args:
+        repo_root: Absolute path to the git repository root
+        title: Custom PR title
+        description: Custom PR description body
+        target_branch: Target/base branch for the PR (default: main)
+        source_branch: Source/head branch for the PR (default: current branch)
+        assignees: Comma-separated usernames to assign
+        reviewers: Comma-separated usernames to request review from
+        labels: Comma-separated label names
+        draft: Whether to create as draft PR
+        web: Open in browser for editing
+    """
+    result = await _create_github_pr(
+        repo_root=repo_root,
+        title=title if title else None,
+        description=description if description else None,
+        target_branch=target_branch,
+        source_branch=source_branch if source_branch else None,
+        assignees=assignees if assignees else None,
+        reviewers=reviewers if reviewers else None,
+        labels=labels if labels else None,
+        draft=draft,
+        web=web,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+async def post_pr_review_summary(pr_id: str, summary: str, repo_root: str) -> str:
+    """Post a top-level summary comment on a GitHub PR.
+
+    Args:
+        pr_id: Pull request number
+        summary: The formatted summary text to post as a PR comment
+        repo_root: Absolute path to the git repository root
+    """
+    result = await _post_pr_review_summary(pr_id, summary, repo_root)
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+async def post_pr_inline_thread(
+    pr_id: str,
+    file_path: str,
+    line_number: int,
+    body: str,
+    repo_root: str,
+) -> str:
+    """Post an inline review comment on a specific line of a GitHub PR diff.
+
+    The tool automatically fetches the required HEAD SHA and constructs
+    the GitHub API position data. Just provide the file, line, and text.
+
+    Args:
+        pr_id: Pull request number
+        file_path: Path to the file in the diff (e.g., 'src/app.py')
+        line_number: Line number in the new version of the file
+        body: The formatted finding text to post as a review comment
+        repo_root: Absolute path to the git repository root
+    """
+    result = await _post_pr_inline_thread(pr_id, file_path, line_number, body, repo_root)
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+async def fetch_pr_discussions(pr_id: str, repo_root: str) -> str:
+    """Fetch all review comments from a GitHub PR with structured data.
+
+    Returns comments grouped into threads with file positions, bodies,
+    replies, and author info. Uses --paginate for complete results.
+
+    Args:
+        pr_id: Pull request number
+        repo_root: Absolute path to the git repository root
+    """
+    result = await _fetch_pr_discussions(pr_id, repo_root)
+    return json.dumps(result, indent=2)
+
+
+@mcp_server.tool()
+async def reply_to_pr_comment(
+    pr_id: str, comment_id: str, body: str, repo_root: str
+) -> str:
+    """Reply to a specific review comment on a GitHub PR.
+
+    Args:
+        pr_id: Pull request number
+        comment_id: The review comment ID to reply to
+        body: Reply text (markdown supported)
+        repo_root: Absolute path to the git repository root
+    """
+    result = await _reply_to_pr_comment(pr_id, comment_id, body, repo_root)
     return json.dumps(result, indent=2)
 
 

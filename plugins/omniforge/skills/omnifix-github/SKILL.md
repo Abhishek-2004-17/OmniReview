@@ -1,39 +1,41 @@
 ---
-name: omnifix-gitlab
-description: Use when fixing review findings on a GitLab MR, resolving inline discussion threads, applying code review suggestions, or when asked to fix issues from an OmniForge report
-argument-hint: <mr-number>
-allowed-tools: [Read, Glob, Grep, Bash, Agent, Write, Edit]
+name: omnifix-github
+description: Use when fixing review findings on a GitHub PR, resolving inline review threads, applying code review suggestions, or when asked to fix issues from an OmniForge report
+version: 1.0.0
+license: Apache-2.0
+argument-hint: <pr-number>
+allowed-tools: [Read, Glob, Grep, Bash, Agent, Write, Edit, mcp__omniforge__fetch_pr_data, mcp__omniforge__fetch_pr_discussions, mcp__omniforge__reply_to_pr_comment, mcp__omniforge__cleanup_omnifix_worktrees]
 ---
 
 # OmniFix
 
-> **Automated review finding fixer — triage with parallel subagents, sequential fixing, verification, thread resolution.**
+> **Automated review finding fixer — triage with parallel subagents, sequential fixing, verification, comment replies.**
 
-Fetch unresolved discussion threads from a GitLab MR, triage each finding with parallel subagents in isolated worktrees, present results for user approval, apply approved fixes sequentially, verify with a fresh-eyes agent, commit, post replies on threads, and clean up.
+Fetch unresolved review threads from a GitHub PR, triage each finding with parallel subagents in isolated worktrees, present results for user approval, apply approved fixes sequentially, verify with a fresh-eyes agent, commit, post replies on threads, and clean up.
 
 **Core principle:** Parallel triage + user approval gate + sequential fix + verification = safe, high-quality automated fixes.
 
-**Announce at start:** "I'm using OmniFix to fix review findings on MR !{id}."
+**Announce at start:** "I'm using OmniFix to fix review findings on PR #{id}."
 
 ## Prerequisites
 
-- `glab` CLI authenticated (`glab auth status` to verify)
-- Git repository with remote pointing to GitLab
+- `gh` CLI authenticated (`gh auth status` to verify)
+- Git repository with remote pointing to GitHub
 - Current working directory is in the git repo
-- MR must have unresolved discussion threads
+- PR must have unresolved review comment threads
 
 ## Input Parsing
 
-Accept any of: MR number (`136`), prefixed (`!136`), or full GitLab URL.
-Extract MR ID. If URL provided, extract project path and MR IID.
+Accept any of: PR number (`136`), prefixed (`#136`), or full GitHub URL.
+Extract PR ID. If URL provided, extract owner/repo and PR number.
 
 ## The Process
 
 ```
-Input: MR number with unresolved review findings
+Input: PR number with unresolved review findings
     |
     v
-Phase 1: GATHER — fetch unresolved discussions + MR data
+Phase 1: GATHER — fetch unresolved comments + PR data
     |
     v
 Phase 2: TRIAGE — N parallel subagents validate findings in read-only worktrees
@@ -48,7 +50,7 @@ Phase 4: FIX — single subagent applies approved fixes sequentially in writable
 Phase 5: VERIFY — fresh-eyes verification subagent reviews all changes
     |
     v
-Phase 6: COMMIT + POST — commit, push (with permission), reply on threads, resolve
+Phase 6: COMMIT + POST — commit, push (with permission), reply on threads
     |
     v
 Phase 7: CLEANUP — remove all worktrees (ALWAYS runs)
@@ -60,22 +62,25 @@ Phase 7: CLEANUP — remove all worktrees (ALWAYS runs)
 
 Fetch ALL data before dispatching triage agents.
 
-**Step 1:** Fetch discussions.
+**Step 1:** Fetch discussions/review comments.
 
 ```
-mcp__omniforge__fetch_mr_discussions(mr_id="{id}", repo_root="{cwd}")
+mcp__omniforge__fetch_pr_discussions(pr_id="{id}", repo_root="{cwd}")
 ```
 
-Returns structured discussion threads with: `discussion_id`, `resolvable`, `resolved`, `type` (inline/general), `file_path`, `line_number`, `body`, `author`, `replies`.
+Returns structured review comment threads with: `comment_id`, `type` (inline/general), `file_path`, `line_number`, `body`, `author`, `replies`.
+
+**Note:** GitHub does not have native thread resolution (resolve/unresolve) like GitLab. Instead of `resolvable`/`resolved` fields, use GitHub's review thread state. Threads are considered "open" if they have no resolving review. The `fetch_pr_discussions` tool handles this distinction.
 
 **Step 2:** Filter discussions.
-- Keep only: `resolvable: true` AND `resolved: false`
-- Skip: system notes, OmniForge summary comments (`individual_note: true` with `resolvable: false`)
+- Keep only: open/unresolved review threads (not already addressed)
+- Skip: system notes, OmniForge summary comments (individual top-level comments)
+- Skip: resolved/dismissed review threads
 
-**Step 3:** Fetch MR metadata.
+**Step 3:** Fetch PR metadata.
 
 ```
-mcp__omniforge__fetch_mr_data(mr_id="{id}", repo_root="{cwd}")
+mcp__omniforge__fetch_pr_data(pr_id="{id}", repo_root="{cwd}")
 ```
 
 Returns: title, author, source_branch, target_branch, diff, diff_line_map, commits, files_changed.
@@ -87,8 +92,8 @@ Returns: title, author, source_branch, target_branch, diff, diff_line_map, commi
 **Step 5:** Parse each finding into standardized format:
 ```json
 {
-  "discussion_id": "abc123",
-  "file_path": ".gitlab-ci.yml",
+  "comment_id": "abc123",
+  "file_path": ".github/workflows/ci.yml",
   "line_number": 1072,
   "body": "**Important** — Missing validation...",
   "author": "shahilkadia",
@@ -136,14 +141,14 @@ if [ -n "$MAIN_ROOT" ]; then MAIN_ROOT=$(cd "$(dirname "$MAIN_ROOT")" && pwd); e
 cd "$MAIN_ROOT"
 
 git fetch origin {source_branch}
-git worktree add .worktrees/omnifix-triage-{mr_id}-1 origin/{source_branch} --detach
-git worktree add .worktrees/omnifix-triage-{mr_id}-2 origin/{source_branch} --detach
+git worktree add .worktrees/omnifix-triage-{pr_id}-1 origin/{source_branch} --detach
+git worktree add .worktrees/omnifix-triage-{pr_id}-2 origin/{source_branch} --detach
 # ... up to N
 ```
 
 Before creating, clean any stale worktrees from previous crashed runs:
 ```bash
-git worktree remove .worktrees/omnifix-triage-{mr_id}-* --force 2>/dev/null
+git worktree remove .worktrees/omnifix-triage-{pr_id}-* --force 2>/dev/null
 git worktree prune
 ```
 
@@ -155,8 +160,8 @@ Dispatch all triage agents simultaneously using the **Agent tool** (parallel Age
 - The triage-agent-prompt template with placeholders filled
 
 Fill template placeholders:
-- `{MR_ID}` — MR number
-- `{MR_TITLE}` — MR title
+- `{MR_ID}` — PR number
+- `{MR_TITLE}` — PR title
 - `{WORKTREE_PATH}` — **Absolute** path to agent's worktree
 - `{FINDINGS_FOR_THIS_AGENT}` — JSON array of findings assigned to this agent
 
@@ -165,15 +170,15 @@ Fill template placeholders:
 Each agent returns structured verdicts:
 ```json
 {
-  "discussion_id": "abc123",
-  "file_path": ".gitlab-ci.yml",
+  "comment_id": "abc123",
+  "file_path": ".github/workflows/ci.yml",
   "line_number": 1072,
   "verdict": "VALID",
   "confidence": 92,
   "reasoning": "The finding is correct — variable is validated but not mapped.",
   "proposed_fix": {
     "description": "Add placeholder mapping",
-    "file_path": ".gitlab-ci.yml",
+    "file_path": ".github/workflows/ci.yml",
     "before_context": "sed -i \"s|PLACEHOLDER_STRIPE...",
     "after_code": "sed -i \"s|PLACEHOLDER_STRIPE_PRICE_ENTERPRISE|...\""
   }
@@ -189,10 +194,12 @@ Each agent returns structured verdicts:
 
 After all triage agents complete, immediately remove triage worktrees:
 ```bash
+# Resolve main repo root (handles linked worktrees)
 MAIN_ROOT=$(git rev-parse --git-common-dir 2>/dev/null)
 if [ -n "$MAIN_ROOT" ]; then MAIN_ROOT=$(cd "$(dirname "$MAIN_ROOT")" && pwd); else MAIN_ROOT=$(pwd); fi
 cd "$MAIN_ROOT"
-git worktree remove .worktrees/omnifix-triage-{mr_id}-1 --force
+
+git worktree remove .worktrees/omnifix-triage-{pr_id}-1 --force
 # ... all N
 git worktree prune
 ```
@@ -205,7 +212,9 @@ git worktree prune
 
 **CRITICAL: No code changes until user explicitly approves.**
 
-**REQUIRED REFERENCE:** `./references/approval-guide.md` — you MUST read this before presenting triage results. Contains the exact presentation format (VALID/INVALID/NEEDS_HUMAN sections), auto-resolve options, commit strategy options, and the full user action matrix. Do NOT present results without loading this reference — the format and option text must match exactly.
+**REQUIRED REFERENCE:** `./references/approval-guide.md` — you MUST read this before presenting triage results. Contains the exact presentation format (VALID/INVALID/NEEDS_HUMAN sections), auto-reply options, commit strategy options, and the full user action matrix. Do NOT present results without loading this reference — the format and option text must match exactly.
+
+**Note:** GitHub does not have native thread resolution via API in the same way GitLab does. Instead of "resolve/unresolve", the equivalent action is posting a reply that the concern has been addressed and optionally dismissing the review. The approval guide covers GitHub-specific reply behavior.
 
 ---
 
@@ -217,7 +226,7 @@ git worktree prune
 
 ### Worktree Setup
 
-Create a writable worktree on the MR source branch:
+Create a writable worktree on the PR source branch:
 
 ```bash
 # Resolve main repo root (handles linked worktrees)
@@ -226,14 +235,14 @@ if [ -n "$MAIN_ROOT" ]; then MAIN_ROOT=$(cd "$(dirname "$MAIN_ROOT")" && pwd); e
 cd "$MAIN_ROOT"
 
 git fetch origin {source_branch}
-git worktree add .worktrees/omnifix-{mr_id} -b omnifix-temp-{mr_id} origin/{source_branch}
+git worktree add .worktrees/omnifix-{pr_id} -b omnifix-temp-{pr_id} origin/{source_branch}
 ```
 
 ### Agent Dispatch
 
 Dispatch a single implementer subagent with the fix-agent-prompt template:
-- `{MR_ID}` — MR number
-- `{MR_TITLE}` — MR title
+- `{MR_ID}` — PR number
+- `{MR_TITLE}` — PR title
 - `{WORKTREE_PATH}` — **Absolute** path to writable worktree
 - `{APPROVED_FIXES_JSON}` — JSON array of approved fixes from triage
 - `{TEST_COMMAND}` — Test command (see discovery order below)
@@ -276,10 +285,10 @@ The agent applies fixes **sequentially in file order** (to avoid conflicts):
   "fixes_applied": 2,
   "fixes_failed": 0,
   "tests_passed": true,
-  "files_changed": [".gitlab-ci.yml", "src/auth.py"],
+  "files_changed": [".github/workflows/ci.yml", "src/auth.py"],
   "details": [
-    {"discussion_id": "abc123", "status": "applied", "description": "Added placeholder mapping"},
-    {"discussion_id": "def456", "status": "applied", "description": "Added null check guard"}
+    {"comment_id": "abc123", "status": "applied", "description": "Added placeholder mapping"},
+    {"comment_id": "def456", "status": "applied", "description": "Added null check guard"}
   ]
 }
 ```
@@ -299,8 +308,8 @@ The agent applies fixes **sequentially in file order** (to avoid conflicts):
 ### Agent Dispatch
 
 Dispatch a verification subagent with:
-- `{MR_ID}` — MR number
-- `{MR_TITLE}` — MR title
+- `{MR_ID}` — PR number
+- `{MR_TITLE}` — PR title
 - `{WORKTREE_PATH}` — Absolute path to fix worktree
 - `{FINDINGS}` — Original findings that were being fixed
 - `{GIT_DIFF}` — Complete diff output (`git diff` in the worktree)
@@ -333,15 +342,45 @@ When verification returns `NEEDS_REWORK`:
 
 ## Phase 6: Commit + Post
 
-**Goal:** Commit fixes and update all discussion threads.
+**Goal:** Commit fixes and update all review comment threads.
 
-**REQUIRED REFERENCE:** `./references/commit-and-post-guide.md` — you MUST read this before committing or posting. Contains the race condition check procedure, commit template (with `PRE_COMMIT_ALLOW_NO_CONFIG=1`), push command, thread reply MCP tool calls, resolve MCP tool calls, and summary comment template. Do NOT commit or post without loading this reference — the commit format and thread reply pattern must be followed exactly.
+**REQUIRED REFERENCE:** `./references/commit-and-post-guide.md` — you MUST read this before committing or posting. Contains the race condition check procedure, commit template (with `PRE_COMMIT_ALLOW_NO_CONFIG=1`), push command, thread reply MCP tool calls (`reply_to_pr_comment`), and summary comment template. Do NOT commit or post without loading this reference — the commit format and thread reply pattern must be followed exactly.
+
+**GitHub-specific notes:**
+- GitHub uses `comment_id` instead of `discussion_id` for replies. The `reply_to_pr_comment` MCP tool takes a `comment_id` parameter.
+- GitHub does not have native thread resolution (resolve/unresolve) via the REST API in the same way GitLab does. Instead of resolving threads, post a reply indicating the concern has been addressed. If the thread is part of a PR review, the review can be dismissed, but this is not automatic.
 
 Key rules:
 - **Race condition check** before push — fetch and compare source branch HEAD
 - **Never force-push** — abort if rebase has conflicts
 - **Ask user before pushing** — never auto-push
 - **No AI attribution** in commits or posted content
+
+### Replying to Review Comments
+
+Use the MCP tool for each thread reply:
+
+```
+mcp__omniforge__reply_to_pr_comment(
+  pr_id="{id}",
+  comment_id="{comment_id}",
+  body="{reply_text_with_commit_sha}",
+  repo_root="{cwd}"
+)
+```
+
+**Fallback (without MCP tool):**
+
+```bash
+gh pr comment {id} --body "{reply_text}" --json id
+```
+
+Note: GitHub's `gh pr comment` creates a new top-level comment. To reply to a specific review thread, use the GitHub API:
+```bash
+gh api repos/{owner}/{repo}/pulls/{id}/comments/{comment_id}/replies \
+  --method POST \
+  --field body="{reply_text}"
+```
 
 ---
 
@@ -354,9 +393,9 @@ mcp__omniforge__cleanup_omnifix_worktrees(mr_id="{id}", repo_root="{cwd}")
 ```
 
 Removes:
-- `.worktrees/omnifix-{mr_id}` (fix worktree)
-- `.worktrees/omnifix-triage-{mr_id}-*` (triage worktrees)
-- Temp branch `omnifix-temp-{mr_id}`
+- `.worktrees/omnifix-{pr_id}` (fix worktree)
+- `.worktrees/omnifix-triage-{pr_id}-*` (triage worktrees)
+- Temp branch `omnifix-temp-{pr_id}`
 - `git worktree prune`
 
 **Fallback (if MCP tool unavailable):**
@@ -367,13 +406,13 @@ MAIN_ROOT=$(git rev-parse --git-common-dir 2>/dev/null)
 if [ -n "$MAIN_ROOT" ]; then MAIN_ROOT=$(cd "$(dirname "$MAIN_ROOT")" && pwd); else MAIN_ROOT=$(pwd); fi
 cd "$MAIN_ROOT"
 
-git worktree remove .worktrees/omnifix-{mr_id} --force 2>/dev/null
-for wt in .worktrees/omnifix-triage-{mr_id}-*; do
+git worktree remove .worktrees/omnifix-{pr_id} --force 2>/dev/null
+for wt in .worktrees/omnifix-triage-{pr_id}-*; do
     git worktree remove "$wt" --force 2>/dev/null
 done
-rm -rf .worktrees/omnifix-{mr_id} .worktrees/omnifix-triage-{mr_id}-* 2>/dev/null
+rm -rf .worktrees/omnifix-{pr_id} .worktrees/omnifix-triage-{pr_id}-* 2>/dev/null
 git worktree prune
-git branch -D omnifix-temp-{mr_id} 2>/dev/null
+git branch -D omnifix-temp-{pr_id} 2>/dev/null
 ```
 
 **Return to repo root after cleanup:**
@@ -390,16 +429,16 @@ If any bash commands during Phases 4-6 changed the working directory into the wo
 
 | Error | Response |
 |-------|----------|
-| glab not authenticated | "Run `glab auth login` first." Stop. |
-| MR not found | "MR !{id} not found. Verify the number and repository." Stop. |
-| No unresolved discussions | "MR !{id} has no unresolved discussion threads. Nothing to fix." Stop. |
-| Network failure | Retry glab command once. If still fails, report error and stop. |
+| gh not authenticated | "Run `gh auth login` first." Stop. |
+| PR not found | "PR #{id} not found. Verify the number and repository." Stop. |
+| No unresolved comments | "PR #{id} has no unresolved review threads. Nothing to fix." Stop. |
+| Network failure | Retry gh command once. If still fails, report error and stop. |
 | Worktree creation fails | Try with timestamp suffix. If still fails, clean up and stop. |
 | Triage agent fails | Continue with remaining agents. Note gap in results. |
 | Fix agent returns BLOCKED | Present blocker to user. Offer to skip that fix or abort. |
 | Verification returns NEEDS_REWORK | Rework loop (max 2 iterations), then escalate to user. |
-| Push fails (race condition) | Offer rebase, abort, or separate MR. Never force-push. |
-| Thread reply fails | Collect error, continue with remaining threads, report summary. |
+| Push fails (race condition) | Offer rebase, abort, or separate PR. Never force-push. |
+| Comment reply fails | Collect error, continue with remaining threads, report summary. |
 | Cleanup fails | Force remove directories. Report if still stuck. |
 
 **Cleanup guarantee:** The entire flow is wrapped in a try/finally pattern. Phase 7 runs no matter what.
@@ -413,7 +452,7 @@ If any bash commands during Phases 4-6 changed the working directory into the wo
 | "I can just apply the fix without triage" | Triage catches false positives. Always triage first. |
 | "The fix is obvious, skip verification" | Obvious fixes introduce subtle regressions. Always verify. |
 | "I'll push the fix without asking" | Never auto-push. Always ask user before pushing. |
-| "I'll auto-resolve all threads" | Default is NO auto-resolve. The original reviewer should verify. |
+| "I'll auto-reply 'fixed' on all threads" | Default is NO auto-reply. The original reviewer should verify. |
 | "I'll commit before verification finishes" | Verification exists to catch regressions. Wait for it. |
 | "This finding is clearly valid, no need to check the code" | Be adversarial. Verify against the actual code in the worktree. |
 | "I'll skip tests, the change is minor" | Minor changes break things. Run tests when available. |
@@ -426,19 +465,19 @@ If any bash commands during Phases 4-6 changed the working directory into the wo
 
 ## Never
 
-- Use `gh` (this is GitLab — use `glab` exclusively)
+- Use `glab` (this is GitHub — use `gh` exclusively)
 - Push to origin without explicit user permission
 - Apply code changes before user approval (Phase 3 gate)
-- Auto-resolve threads without user opt-in
+- Auto-reply on threads without user opt-in
 - Skip worktree cleanup (even on failure)
 - Force-push under any circumstance
-- Add AI attribution to commit messages or posted comments
+- Add AI attribution in commit messages or posted comments
 - Edit files in the main workspace (use worktrees)
 - Skip any of the 7 phases for any reason
 
 ## Always
 
-- Fetch discussions and MR data in Phase 1 before dispatching agents
+- Fetch discussions and PR data in Phase 1 before dispatching agents
 - Create isolated worktrees for triage and fixing
 - Present triage results and wait for explicit user approval
 - Apply fixes sequentially in file order (never parallel)
@@ -446,17 +485,16 @@ If any bash commands during Phases 4-6 changed the working directory into the wo
 - Ask user before pushing
 - Post thread replies with commit SHA references
 - Clean up all worktrees regardless of outcome
-- Use `glab` for all GitLab operations
+- Use `gh` for all GitHub operations
 
 ---
 
 ## Integration
 
 **MCP Tools:**
-- `mcp__omniforge__fetch_mr_discussions` — Fetch structured discussion threads
-- `mcp__omniforge__fetch_mr_data` — Fetch MR metadata, diff, and diff_line_map
-- `mcp__omniforge__reply_to_discussion` — Post reply on a discussion thread
-- `mcp__omniforge__resolve_discussion` — Resolve/unresolve a discussion thread
+- `mcp__omniforge__fetch_pr_discussions` — Fetch structured review comment threads
+- `mcp__omniforge__fetch_pr_data` — Fetch PR metadata, diff, and diff_line_map
+- `mcp__omniforge__reply_to_pr_comment` — Post reply on a review comment thread
 - `mcp__omniforge__cleanup_omnifix_worktrees` — Remove all OmniFix worktrees and temp branches
 
 **Subagent Templates:**
